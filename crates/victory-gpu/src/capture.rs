@@ -174,7 +174,10 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 pub(crate) fn wanted(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
-    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    let before_world = world_on()
+        && !preview_enabled()
+        && n.is_multiple_of(16)
+        && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
@@ -346,7 +349,7 @@ pub(crate) fn read_back_of(
     }
 }
 
-/// Saves a frame read back by [`read_back`] (8-bit color only).
+/// Saves a frame read back by [`read_back`], scaling floating-point colors for PNG.
 pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
@@ -354,10 +357,15 @@ pub(crate) fn save_read_back(
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS
+        | DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Some(false),
+        DXGI_FORMAT_B8G8R8A8_TYPELESS
+        | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Some(true),
+        DXGI_FORMAT_R16G16B16A16_TYPELESS | DXGI_FORMAT_R16G16B16A16_FLOAT => None,
         other => {
-            tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
+            tracing::warn!(format = other.0, "frame not saved: unsupported color format");
             return;
         }
     };
@@ -370,7 +378,13 @@ pub(crate) fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        if let Some(bgra) = bgra {
+            save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        } else if let Some(rgba) = to_rgba(
+            f.Format.0 as u32, f.Width as usize, f.Height as usize, f.RowPitch as usize, rows,
+        ) {
+            save(frame, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+        }
         buffer.Unmap(0, None);
     }
 }
@@ -390,9 +404,68 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// A live view of a color target, selected as WIDTHxHEIGHT-fFORMAT[-ORDINAL].
+/// Adapted from Slaktarn700/VIctory, commit 9823139.
+fn preview_spec() -> Option<(u64, u32, i32, usize)> {
+    static SPEC: std::sync::OnceLock<Option<(u64, u32, i32, usize)>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let spec = std::env::var("VICTORY_SHOW_TARGET").ok()?;
+        let mut parts = spec.split('-');
+        let (width, height) = parts.next()?.split_once('x')?;
+        let format = parts.next()?.strip_prefix('f')?.parse().ok()?;
+        let ordinal: usize = parts.next().map_or(Some(1), |value| value.parse().ok())?;
+        if ordinal == 0 || parts.next().is_some() {
+            return None;
+        }
+        Some((width.parse().ok()?, height.parse().ok()?, format, ordinal))
+    })
+}
+
+pub(crate) fn preview_enabled() -> bool {
+    preview_spec().is_some()
+}
+
+pub(crate) fn preview_only_when_black() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_SHOW_TARGET_IF_BLACK").is_some_and(|v| v == "1"))
+}
+
+static PREVIEW_TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn take_preview() -> Option<(std::sync::Arc<crate::resource::HostTexture>, u32)> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let (_, _, _, ordinal) = preview_spec()?;
+    let mut targets = PREVIEW_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    let selected = targets.drain(..).nth(ordinal - 1)?.1;
+    let state = selected.state.load(Relaxed);
+    Some((selected, state))
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() {
+        return;
+    }
+    if let Some((width, height, format, ordinal)) = preview_spec()
+        && let Some(copy) = crate::resource::host_copy(resource)
+    {
+        // SAFETY: a live resource held by copy.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if (desc.Width, desc.Height, desc.Format.0) == (width, height, format)
+            && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && desc.MipLevels == 1
+            && desc.DepthOrArraySize == 1
+            && desc.SampleDesc.Count == 1
+        {
+            let mut targets = PREVIEW_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+            if targets.len() < ordinal && !targets.iter().any(|&(r, _)| r == resource as usize) {
+                targets.push((resource as usize, copy));
+            }
+        }
+    }
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());

@@ -2105,6 +2105,10 @@ fn late_exact() -> bool {
 /// submission settles the flights all the same, for the sweep that lets
 /// idle host objects go (it needs nothing in the air).
 pub(crate) fn late_free_present() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::preview_enabled() {
+        return false;
+    }
     late_stage() > 2
 }
 
@@ -6156,7 +6160,7 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -8013,9 +8017,53 @@ impl Host {
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         let showing = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let preview = crate::capture::take_preview();
+        #[cfg(feature = "diagnostics")]
+        let (texture, state) = match &preview {
+            Some((target, target_state))
+                if target.texture.as_raw() != texture.as_raw()
+                    // SAFETY: the preview holds a live resource.
+                    && swap_format(unsafe { target.texture.GetDesc() }.Format).is_some()
+                    && (!crate::capture::preview_only_when_black()
+                        || self.original_frame_is_black(texture, state)) =>
+            {
+                static REPORTED: std::sync::Once = std::sync::Once::new();
+                REPORTED.call_once(|| tracing::info!(frame, "showing the selected intermediate color target"));
+                (&target.texture, legal_state(&target.texture, *target_state))
+            }
+            _ => (texture, state),
+        };
         let shown = self.present_now(texture, state, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn original_frame_is_black(&self, texture: &ID3D12Resource, state: u32) -> bool {
+        let Ok(list) = self.new_list() else {
+            return false;
+        };
+        let state = D3D12_RESOURCE_STATES(state as i32);
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: the presentation queue has settled and both resources stay alive through execute.
+        let probe = unsafe {
+            if state != copy {
+                list.list.ResourceBarrier(&[transition(texture, state, copy)]);
+            }
+            let probe = crate::capture::probe(&self.device, &list.list, texture);
+            if state != copy {
+                list.list.ResourceBarrier(&[transition(texture, copy, state)]);
+            }
+            probe
+        };
+        list.close();
+        if let Some(probe) = probe {
+            self.execute(&[&list]);
+            crate::capture::black(&probe)
+        } else {
+            false
+        }
     }
 
     fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {

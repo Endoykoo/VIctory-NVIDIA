@@ -62,6 +62,14 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    pub(crate) resolves_light: bool,
+    #[cfg(windows)]
+    pub(crate) resolves_reflections: bool,
+    #[cfg(windows)]
+    pub(crate) draws_sky_dome: bool,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    inactive_ray_probe: bool,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
     /// ([`Shader::walks`]).
@@ -115,6 +123,22 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                resolves_light: stage == "compute"
+                    && crate::ambient::enabled()
+                    && bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
+                resolves_reflections: stage == "compute"
+                    && crate::ambient::enabled()
+                    && bytes.windows(crate::ambient::REFLECTED.len()).any(|w| w == crate::ambient::REFLECTED),
+                #[cfg(windows)]
+                draws_sky_dome: stage == "pixel"
+                    && crate::ambient::enabled()
+                    && bytes.windows(crate::ambient::SKY.len()).any(|w| w == crate::ambient::SKY),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                inactive_ray_probe: stage == "compute"
+                    && skip_inactive_probe_enabled()
+                    && bytes.windows(PROBE_ACTIVATION.len()).any(|w| w == PROBE_ACTIVATION),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
@@ -514,18 +538,45 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
+const PROBE_ACTIVATION: &[u8] = b"CS_ScreenProbes_ActivateRays";
+
+/// Belobug 6986a57: probe activation has no consumer when the ray passes are off.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_inactive_probe_enabled() -> bool {
+    static SKIP_INACTIVE_PROBE: OnceLock<bool> = OnceLock::new();
+    *SKIP_INACTIVE_PROBE.get_or_init(|| {
+        std::env::var_os("VICTORY_SKIP_INACTIVE_PROBE_RAYS").is_some_and(|v| v == "1")
+            && !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+            && !std::env::var_os("VICTORY_RAYS").is_some_and(|v| v == "1")
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
+    let skip_probe = skip_inactive_probe_enabled();
+    if hashes.is_empty() && !skip_probe {
         return None;
     }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| {
+            if hashes.contains(&shader.hash) {
+                return true;
+            }
+            if !skip_probe || !shader.inactive_ray_probe {
+                return false;
+            }
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                tracing::info!(hash = shader.hash, "skipping inactive screen-probe ray activation")
+            });
+            true
+        })
         .map(|shader| shader.hash.as_str())
 }
 
@@ -749,6 +800,8 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    #[cfg(windows)]
+    graphics.apply_integer_blend_bypass();
     hand_out(
         shaders,
         #[cfg(windows)]

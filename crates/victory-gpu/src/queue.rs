@@ -1314,7 +1314,13 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     // With `present_behind`: the frame is shown by our thread, behind what
     // the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
-    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
+    let sent_behind = {
+        #[cfg(feature = "diagnostics")]
+        let preview = crate::capture::preview_enabled();
+        #[cfg(not(feature = "diagnostics"))]
+        let preview = false;
+        !preview && present_behind() && send_behind(this, planes, plane_parameters)
+    };
     #[cfg(not(windows))]
     let _ = this;
     // Submissions sent to the card and not waited for are settled first,

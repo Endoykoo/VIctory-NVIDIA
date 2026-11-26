@@ -1,4 +1,45 @@
-# VIctory fork (work in progress)
+# VIctory NVIDIA
+
+An experimental [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+derivative with rendering and texture-streaming changes tested on an NVIDIA
+GeForce RTX 5060. It uses VIctory's existing workspace layout and build commands.
+
+## Status on RTX 5060
+
+On Windows with the Series X profile, the opening cutscene renders in real time
+with audio. Observed speed was roughly 2–5 FPS in the cutscene. Frame rate varies
+by shot and can fall below 5 FPS. Some character details and surfaces still
+render incorrectly, and some textures appear late or at reduced detail. This
+run establishes cutscene rendering on one machine. Gameplay and other GPUs
+still need testing for this fork.
+
+The changes include a reduced-detail texture mode, an ambient-light fallback for
+disabled screen-probe rays, and a cache for repeated Direct3D 12 render-target
+bindings. The ambient-light work draws on
+[VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD).
+The binding cache draws on [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX/commit/ca1d519f18ccece3daf2b05191a43fae17ac6f91),
+which credits ZJOU's earlier work.
+
+## Getting started on NVIDIA
+
+Follow the [build and configuration instructions](#getting-started) below, then
+set these options in the PowerShell session used to launch VIctory:
+
+```powershell
+$env:VICTORY_SKIP_INACTIVE_PROBE_RAYS = '1'
+$env:VICTORY_TEXTURE_DROP_MIPS = '3'
+$env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '2048'
+$env:VICTORY_AMBIENT = '0.20'
+$env:VICTORY_TEXTURE_NO_WAIT = '1'
+```
+
+The repository ships the compatibility-layer source and uses game files supplied
+locally by the user. See the [asset policy](docs/asset-policy.md).
+
+## Upstream project notes
+
+The results below are retained from `fxceless/victory-fork` and describe its
+hardware, configuration and test runs.
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from

@@ -1128,6 +1128,20 @@ impl HostHeap {
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
 
+    /// Queued views referenced by the current material. A view held back
+    /// by the background budget can use the foreground texture reserve.
+    pub(crate) fn priority_texture_slots(&self, indices: &[u32], frame: u64, room: bool) -> Vec<(u32, u64)> {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        indices
+            .iter()
+            .filter_map(|&index| {
+                let waiting = textures.slots.get(&index)?;
+                (waiting.due <= frame || (room && textures.held.get(&index) == Some(&waiting.write)))
+                    .then_some((index, waiting.write))
+            })
+            .collect()
+    }
+
     /// Every title slot of the queue that is due at `frame`, and whether
     /// it was uploaded before (in part, or whole and waiting for another
     /// look): for the card accounting line
@@ -1277,36 +1291,6 @@ impl HostHeap {
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
         }
         [held, slots.len(), slots.len()]
-    }
-
-    /// Whether host slot `index` is made from the very record the title
-    /// has at `handle` now. Its host texture then exists (a slot keeps what
-    /// it views), so bringing that texture up to date takes no memory of
-    /// the card.
-    pub(crate) fn texture_slot_made_from(&self, index: u32, handle: u64) -> bool {
-        if index >= self.count {
-            return false;
-        }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        let key = u64::from(generation) << 32 | u64::from(i);
-        if tag != VIEW_TAG {
-            return false;
-        }
-        // And the slot holds a host resource: a slot is also noted as made
-        // from a view the host could not make (`make` gave nothing, the
-        // slot is null and keeps nothing). The host copy of such a
-        // texture is held by no slot, may have been let go, and would be
-        // made anew here, with the card full. `made` first, then `kept`,
-        // as `mirror` takes them.
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
-            && self
-                .kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
-                .is_some_and(Option::is_some)
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -1923,6 +1907,22 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_view(index, handle, for_draw, false).ok().flatten()
+    }
+
+    /// Mirror a sampled view without allocating a new texture when the
+    /// card is full. A missing resident copy leaves the slot queued.
+    pub(crate) fn mirror_resident(&self, index: u32, handle: u64) -> Result<Option<View>, ()> {
+        self.mirror_view(index, handle, true, true)
+    }
+
+    fn mirror_view(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        resident_only: bool,
+    ) -> Result<Option<View>, ()> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -1935,7 +1935,7 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            return Ok(None);
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -1954,9 +1954,29 @@ impl HostHeap {
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer(index, None, false);
             }
-            return None;
+            return Ok(None);
         };
-        if made[index as usize] != key {
+        let already_held = made[index as usize] == key
+            && (!resident_only
+                || self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some());
+        // Hold the exact texture through make(), so the idle sweep cannot
+        // reclaim it between the residency check and the descriptor write.
+        let _resident = if resident_only && !already_held {
+            let image = match &view {
+                View::Shader(image, _) => *image as crate::object::This,
+                View::Placed(false, desc, words) if desc[0] != 1 => {
+                    let address = u64::from(words[10]) | (u64::from(words[11]) << 32);
+                    crate::resource::placed_known(address, desc).ok_or(())?
+                }
+                _ => return Err(()),
+            };
+            let copy = crate::resource::resident_copy(image).ok_or(())?;
+            tracing::debug!(index, "binding another view of a resident texture while VRAM is full");
+            Some(copy)
+        } else {
+            None
+        };
+        if !already_held {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -1987,7 +2007,7 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
+                return Ok(Some(view));
             }
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -2000,7 +2020,7 @@ impl HostHeap {
             }
             self.keep(index, kept.flatten());
         }
-        Some(view)
+        Ok(Some(view))
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).
@@ -2066,6 +2086,39 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// A texture view `desc` on a host copy that leaves out the title's
+/// `drop` largest levels (`crate::resource::drop_levels`): its levels
+/// shift down by as many ([`crate::resource::shift_levels`]). 2D textures,
+/// arrays and cubes only, the dimensions such copies have.
+fn shift_view_levels(drop: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+    if drop == 0 {
+        return;
+    }
+    let shift = crate::resource::shift_levels;
+    // SAFETY: each arm reads and writes the union member its dimension names.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -2753,6 +2806,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                if let Some(d) = desc.as_mut() {
+                    shift_view_levels(crate::resource::dropped(resource), d);
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -3418,6 +3474,27 @@ mod tests {
         assert_eq!(spans.slots_holding(at + 0x20000, at + 0x21000), [3]);
         assert_eq!(spans.slots_holding(at + 0x32000, at + 0x33000), [] as [u32; 0]);
         assert_eq!(spans.slots_holding(at + 0x2000, at + 0x2000), [] as [u32; 0]);
+    }
+
+    #[test]
+    fn active_material_can_claim_a_texture_held_by_the_background_budget() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let mut queue = heap.textures.lock().unwrap();
+        queue.written(1, 10, 0, false);
+        queue.written(2, 10, 0, false);
+        queue.written(3, 10, 0, false);
+        let first = queue.slots[&1].write;
+        let second = queue.slots[&2].write;
+        let third = queue.slots[&3].write;
+        queue.hold(2, second, 20);
+        queue.later(3, third, 10, 20);
+        drop(queue);
+
+        assert_eq!(heap.priority_texture_slots(&[1, 2, 3], 10, false), [(1, first)]);
+        assert_eq!(heap.priority_texture_slots(&[1, 2, 3], 10, true), [(1, first), (2, second)]);
+        assert_eq!(heap.priority_texture_slots(&[3], 11, true), [(3, third)]);
     }
 
     /// A write behind the guards' back under a placed texture: a slot
