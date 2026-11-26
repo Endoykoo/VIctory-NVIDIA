@@ -6,12 +6,13 @@ GeForce RTX 5060. It uses VIctory's existing workspace layout and build commands
 
 ## Status on RTX 5060
 
-On Windows with the Series X profile, the opening cutscene renders in real time
-with audio. Observed speed was roughly 2–5 FPS in the cutscene. Frame rate varies
-by shot and can fall below 5 FPS. Some character details and surfaces still
-render incorrectly, and some textures appear late or at reduced detail. This
-run establishes cutscene rendering on one machine. Gameplay and other GPUs
-still need testing for this fork.
+On Windows with the Series X profile, the opening cutscene renders with
+audio and the Prologue autosave loads into controllable gameplay. The standard
+NVIDIA settings recorded roughly 3–4 FPS in the early Prologue on a GeForce
+RTX 5060 8 GB and Intel Core Ultra 5 225F. Performance varies by scene and
+can drop below 5 FPS. Some surfaces render incorrectly, and some textures
+appear late or at reduced detail. Testing covered the opening and early
+Prologue on this machine.
 
 The changes include a reduced-detail texture mode, an ambient-light fallback for
 disabled screen-probe rays, and a cache for repeated Direct3D 12 render-target
@@ -19,6 +20,9 @@ bindings. The ambient-light work draws on
 [VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD).
 The binding cache draws on [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX/commit/ca1d519f18ccece3daf2b05191a43fae17ac6f91),
 which credits ZJOU's earlier work.
+The mesh dispatch and wide GPU hashing changes come from kelvaroq's patches
+0041 and 0042. The card-buffer size option was adapted from
+[cool_fox](https://github.com/codec-d/cool_fox).
 
 ## Getting started on NVIDIA
 
@@ -31,7 +35,15 @@ $env:VICTORY_TEXTURE_DROP_MIPS = '3'
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '2048'
 $env:VICTORY_AMBIENT = '0.20'
 $env:VICTORY_TEXTURE_NO_WAIT = '1'
+$env:VICTORY_ASYNC_SUBMIT = '1'
+$env:VICTORY_QUEUE2 = '1'
+$env:VICTORY_JOIN_PARTS = '1'
+$env:VICTORY_CARD_BUFFERS_MIN_KB = '256'
+$env:VICTORY_OUTPUT_720P = '1'
 ```
+
+`VICTORY_OUTPUT_720P` scales the final output to 720p. The title chooses its
+internal render resolution.
 
 The repository ships the compatibility-layer source and uses game files supplied
 locally by the user. See the [asset policy](docs/asset-policy.md).

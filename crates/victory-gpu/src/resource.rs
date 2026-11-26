@@ -1277,7 +1277,8 @@ fn fills(desc: &ResourceDesc) -> bool {
 /// stop at the memory budget with about 15,000 more due, and the GPU time
 /// per frame triples (RTX 4060 Ti, first room). Only 2D textures the
 /// title fills ([`fills`]), arrays and cubes included, at least 512 texels
-/// on their shorter side, whose sides the levels left out halve exactly
+/// on their shorter side by default (`VICTORY_TEXTURE_MIN_SIDE=256` also
+/// includes medium textures), whose sides the levels left out halve exactly
 /// into whole 4-texel blocks: host level `m` is then title level `m + N`
 /// texel for texel. Shaders see the texture at half the size per level
 /// left out: views shift their levels ([`shift_levels`]), and copies
@@ -1285,13 +1286,19 @@ fn fills(desc: &ResourceDesc) -> bool {
 #[cfg(windows)]
 pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
     const TEXTURE_2D: u32 = 3;
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let n = *N.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+    static SETTINGS: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    let (n, min_side) = *SETTINGS.get_or_init(|| {
+        let levels = std::env::var("VICTORY_TEXTURE_DROP_MIPS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(0)
-            .min(4)
+            .min(4);
+        let min_side = std::env::var("VICTORY_TEXTURE_MIN_SIDE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(512)
+            .max(256);
+        (levels, min_side)
     });
     if n == 0 || !fills(desc) || desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
         return 0;
@@ -1299,7 +1306,7 @@ pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
     let n = n.min(u32::from(desc.mip_levels).saturating_sub(1));
     let (w, h) = (desc.width, u64::from(desc.height));
     let whole = |side: u64| side % (4 << n) == 0;
-    if n == 0 || w.min(h) < 512 || !whole(w) || !whole(h) {
+    if n == 0 || w.min(h) < min_side || !whole(w) || !whole(h) {
         return 0;
     }
     n
@@ -2828,8 +2835,14 @@ extern "system" fn resource_release(this: This) -> u32 {
 /// `out` only asks for residency.
 extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
     if !out.is_null() {
+        let resource = resource(this);
+        let data = resource.data();
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if resource.desc.dimension == BUFFER {
+            crate::buffer_trace::range("map", data as usize, resource.desc.width as usize, 0, 0);
+        }
         // SAFETY: checked non-null; the title passes room for a pointer.
-        unsafe { out.write(resource(this).data()) };
+        unsafe { out.write(data) };
     }
     S_OK
 }

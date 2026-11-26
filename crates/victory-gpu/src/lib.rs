@@ -35,6 +35,8 @@ mod drvwatch;
 #[cfg(windows)]
 mod fpsbox;
 #[cfg(windows)]
+mod output_scale;
+#[cfg(windows)]
 mod spread;
 #[cfg(windows)]
 mod draw;
@@ -45,10 +47,13 @@ pub mod frame;
 pub mod framelog;
 #[cfg(windows)]
 mod host;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod buffer_trace;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+mod launch;
 pub mod list;
 pub mod object;
 pub mod pipeline;

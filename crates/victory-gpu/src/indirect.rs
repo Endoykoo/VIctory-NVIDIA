@@ -350,6 +350,7 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    counted(spec.0, count.is_some());
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
@@ -370,8 +371,44 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
+    counted(spec.0, false);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+}
+
+/// Clamps since the last line, by the kind of their records: draws,
+/// indexed draws, dispatches, mesh dispatches, and of all those with a
+/// count buffer.
+static BOUNDED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn counted(kind: u32, count: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    BOUNDED[match kind {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 3,
+    }]
+    .fetch_add(1, Relaxed);
+    if count {
+        BOUNDED[4].fetch_add(1, Relaxed);
+    }
+}
+
+/// For the frame-rate line.
+pub(crate) fn line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = BOUNDED.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    if n[..4].iter().sum::<f64>() > 0.0 {
+        tracing::info!(
+            "indirect calls clamped by a pass of ours per frame (two full waits each): {:.0} draws, {:.0} indexed draws,              {:.0} dispatches, {:.0} mesh dispatches; {:.0} of them with a count buffer",
+            n[0],
+            n[1],
+            n[2],
+            n[3],
+            n[4]
+        );
+    }
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -1182,12 +1219,10 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                crate::host::card_compare_dispatch(&warp.list, [0u32, 0, size as u32, PIECES, 0, mode]);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1256,12 +1291,10 @@ void main() {
             unsafe {
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, SKEW, size as u32, pieces, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                crate::host::card_compare_dispatch(&warp.list, [0u32, SKEW, size as u32, pieces, 0, mode]);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);

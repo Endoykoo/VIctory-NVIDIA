@@ -1639,11 +1639,22 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one group of 64 threads per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them;
+/// [`card_compare_dispatch`]): `differs` gets a dword per piece, 1 where a
+/// byte differs. The offsets are widened to 16 bytes; buffers are multiples
+/// of 64 KiB, and a piece flagged for a byte just outside the range costs a
+/// fetch that finds nothing.
+///
+/// The piece's 64 threads read it a kilobyte at a time, side by side, each
+/// hashing every 64th 16 bytes, and the group's first thread hashes their
+/// 64 hashes in order. It was one thread a piece walking its 4,096 steps
+/// one after the other, each waiting for its load: a pass took the time of
+/// those 4,096 loads however few its pieces, and there were 500 to 1,400
+/// hash passes and some 390 compares a frame in the prologue (the fork's
+/// card meter: 16 ms a frame in the lists that hash, 10 in the compares,
+/// RTX 4070). The hash is the card's alone (stored by one pass, compared
+/// by a later one, both this shader); nothing on the CPU makes it.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1657,6 +1668,58 @@ cbuffer Span : register(b0) {
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
 // last sent up (or hashed whole, the first time).
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 partial[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint gi : SV_GroupIndex) {
+    // One group per piece: `card_compare_dispatch` runs `pieces` groups.
+    uint piece = first + group.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u ^ gi, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu + gi);
+    [loop]
+    for (uint at = lo + gi * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    partial[gi] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (gi != 0u) return;
+    h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint t = 0u; t < 64u; t++) {
+        h = (h ^ partial[t]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    if (compare != 0u) {
+        differs.Store(out_at + group.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        // With the copy-back on its own thread: the next compare of the
+        // piece finds what is written from here on.
+        if (compare == 2u) hashes.Store4(piece * 16u, h);
+    } else {
+        hashes.Store4(piece * 16u, h);
+    }
+}
+"#;
+
+/// [`CARD_COMPARE`] as it was, one thread a piece walking it alone
+/// (`VICTORY_CARD_HASH_WIDE=0`); its hashes are other than the wide one's.
+const CARD_COMPARE_SERIAL: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
 [RootSignature(RS)]
@@ -1677,14 +1740,50 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     if (compare != 0u) {
         differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
         if (compare == 2u) hashes.Store4(piece * 16u, h);
     } else {
         hashes.Store4(piece * 16u, h);
     }
 }
 "#;
+
+/// Whether the card compare reads each piece with a group of 64 threads
+/// ([`CARD_COMPARE`]; `VICTORY_CARD_HASH_WIDE=0`: one thread a piece, as
+/// before).
+fn card_hash_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0"))
+}
+
+/// Records [`CARD_COMPARE`] over `constants`' pieces (its six root
+/// constants: first piece, skew, size, pieces, first result's byte, mode):
+/// one group a piece, at most 65,535 groups a dispatch. The compare's root
+/// signature, pipeline and views are set.
+///
+/// # Safety
+/// An open list with the compare bound.
+pub(crate) unsafe fn card_compare_dispatch(list: &ID3D12GraphicsCommandList, constants: [u32; 6]) {
+    let [first, skew, size, pieces, out_at, mode] = constants;
+    if !card_hash_wide() {
+        // SAFETY: as the caller says.
+        unsafe {
+            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.Dispatch(pieces.div_ceil(64), 1, 1);
+        }
+        return;
+    }
+    let mut done = 0u32;
+    while done < pieces {
+        let n = (pieces - done).min(65_535);
+        let part = [first + done, skew, size, n, out_at + 4 * done, mode];
+        // SAFETY: as the caller says.
+        unsafe {
+            list.SetComputeRoot32BitConstants(0, 6, part.as_ptr().cast(), 0);
+            list.Dispatch(n, 1, 1);
+        }
+        done += n;
+    }
+}
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
@@ -3426,6 +3525,8 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     fill_check::line();
     fill_ahead::line(frames);
+    crate::launch::line(frames);
+    crate::indirect::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -3502,10 +3603,13 @@ fn late_line(frames: f64) {
         }
     }
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, unwatched, unasked, capped, unsnapped] =
+            crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB; given up for the flights to be settled: {unwatched:.1} copies not \
+             write-watched, {unasked:.1} ranges no journal or kernel answered, {capped:.1} over the cap of changed runs \
+             (VICTORY_MERGE_RUNS), {unsnapped:.1} copies with no snapshot",
             bytes / (1 << 20) as f64
         );
     }
@@ -3959,10 +4063,11 @@ impl Host {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
+        let source = if card_hash_wide() { CARD_COMPARE } else { CARD_COMPARE_SERIAL };
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -4280,9 +4385,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            card_compare_dispatch(&list, [run.first, run.skew, size as u32, run.pieces, 0, 0]);
                         }
                     }
                     crate::cardmeter::end(list, timed);
@@ -4374,10 +4477,9 @@ impl Host {
                             continue;
                         };
                         let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        card_compare_dispatch(&list, constants);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
@@ -4700,6 +4802,8 @@ impl Host {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+            #[cfg(feature = "diagnostics")]
+            shadow.trace_readback(*lo, *hi);
             let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
             shadow.walls_merged(gpu.len(), merged);
             written += merged;
@@ -7020,6 +7124,8 @@ impl HostList {
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
+                    #[cfg(feature = "diagnostics")]
+                    crate::buffer_trace::range("copy_source", src, len, 0, 0);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7031,6 +7137,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
+                        crate::buffer_trace::range("upload_source", src, len, 0, 0);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
@@ -7040,6 +7147,7 @@ impl HostList {
                     {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
+                        crate::buffer_trace::range("gpu_refresh", *address, *len, 0, 0);
                     }
                     batch.add(shadow, *address, *len);
                     continue;
@@ -8073,7 +8181,19 @@ impl Host {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let native = (desc.Width as u32, desc.Height);
+        let capped = crate::output_scale::dimensions(native.0, native.1);
+        let scaler = if capped != native
+            && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && desc.SampleDesc.Count == 1
+            && desc.DepthOrArraySize == 1
+            && !desc.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+        {
+            crate::output_scale::Pass::get(self, format)
+        } else {
+            None
+        };
+        let (width, height) = if scaler.is_some() { capped } else { native };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -8118,6 +8238,17 @@ impl Host {
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
+            let descriptors = if scaler.is_some() {
+                match crate::output_scale::Pass::descriptors(self) {
+                    Ok(descriptors) => Some(descriptors),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not allocate a 720p source view");
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
@@ -8142,15 +8273,27 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            if let (Some(scaler), Some(descriptors)) = (scaler, descriptors) {
+                let readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                list.ResourceBarrier(&[
+                    transition(texture, state, readable),
+                    transition(&back, D3D12_RESOURCE_STATE_PRESENT, target),
+                ]);
+                scaler.draw(self, copy, &descriptors, texture, &back, (width, height, format));
+                list.ResourceBarrier(&[
+                    transition(texture, readable, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(&back, target, D3D12_RESOURCE_STATE_COPY_DEST),
+                ]);
+                static REPORTED: std::sync::Once = std::sync::Once::new();
+                REPORTED.call_once(|| tracing::info!(source_width = native.0, source_height = native.1, width, height, "scaled title frame for presentation"));
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+                ]);
+                list.CopyResource(&back, texture);
+            }
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
             crate::fpsbox::draw(self, list, &back, (width, height, format));

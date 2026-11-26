@@ -158,7 +158,19 @@ fn card_limits() -> (u64, u64) {
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        let mut min = mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20);
+        // `VICTORY_CARD_BUFFERS_MIN_KB` (from cool_fox, after fxceless
+        // c36971b2): the least size in KiB, so that it can go under 1 MiB.
+        // In the PC's memory every load, store and atomic a shader does on
+        // such a copy crosses the bus. RTX 5060, opening cutscene: 256 gave
+        // the title's lists 96-103 ms of card time a frame against about 118;
+        // 64 made 3,351 copies and their upkeep cost more than it won.
+        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
+            && kib > 0
+        {
+            min = kib << 10;
+        }
+        (min, mb("VICTORY_CARD_BUFFERS_MB", 1024))
     })
 }
 
@@ -1815,12 +1827,15 @@ fn back_piece(
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
-/// compared, changed runs put in, and their bytes.
-static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// compared, changed runs put in, and their bytes; then why a merge gave
+/// up, the flights settled instead: a copy not write-watched, no journal
+/// or kernel answer for the range, more changed runs than the cap, no
+/// snapshot to merge into.
+static MERGED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 7] {
+    [0, 1, 2, 3, 4, 5, 6].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
@@ -3109,6 +3124,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            MERGED[3].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -3165,6 +3181,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                MERGED[4].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3200,6 +3217,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
+                        MERGED[5].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -3211,6 +3229,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        MERGED[6].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
@@ -3536,6 +3555,11 @@ impl Shadow {
     /// The offsets of piece `i` of `span` that lie in the span.
     pub(crate) fn card_piece(&self, span: &CardSpan, i: u32) -> (usize, usize) {
         card_piece_of(self.start as usize, self.len as usize, span, i)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_readback(&self, from: usize, to: usize) {
+        crate::buffer_trace::range("readback", self.start as usize + from, to - from, self.start, self.len);
     }
 
     /// The walls trace (`crate::host::walls_trace`): a piece of `fetched`
