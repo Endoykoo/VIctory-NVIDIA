@@ -1,18 +1,34 @@
-# VIctory NVIDIA
+# VIctory NVIDIA by Endoykoo
 
 An experimental [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
-derivative with rendering and texture-streaming changes tested on an NVIDIA
-GeForce RTX 5060. It uses VIctory's existing workspace layout and build commands.
+derivative for running GTA VI on Windows from game files you supply. This fork
+focuses on frame pacing and an optional low-resolution gameplay preset tested
+on an NVIDIA GeForce RTX 5060 8 GB. It contains no game files or prebuilt binaries.
 
-## Status on RTX 5060
+## Status on RTX 5060 8 GB
 
-On Windows with the Series X profile, the opening cutscene renders with
-audio and the Prologue autosave loads into controllable gameplay. The standard
-NVIDIA settings recorded roughly 3–4 FPS in the early Prologue on a GeForce
-RTX 5060 8 GB and Intel Core Ultra 5 225F. Performance varies by scene and
-can drop below 5 FPS. Some surfaces render incorrectly, and some textures
-appear late or at reduced detail. Testing covered the opening and early
-Prologue on this machine.
+**2026-11-27, self-reported local test.** On Windows with an RTX 5060 8 GB,
+Intel Core Ultra 5 225F and 32 GB RAM, the Xbox Series build 1.0.2.1 reached
+controllable Prologue gameplay. With the Series S 540p preset, the HUD and
+pause menu rendered, the game resumed from pause, and Lucia moved through the
+prison dorm while the camera responded to input.
+
+| Prologue sample | Internal render size | Average FPS | p95 frame time |
+|---|---|---:|---:|
+| Stationary at the cell window | 960×540 | 8.06 | 224 ms |
+| After resuming, including movement and camera turns | 960×540 | 7.01 | 256 ms |
+
+The 270-second run included startup and the opening cutscenes and was stopped
+by the test harness. The FPS table covers only the indicated gameplay segments.
+The game image was presented at 1280×720. Slower frames still dip below 5 FPS.
+The 540p image is soft and some surfaces or pause-menu backgrounds can render
+incorrectly. Testing covered the early Prologue on this one PC. Earlier Series X
+Prologue runs measured roughly 3–4 FPS with the standard NVIDIA settings.
+
+The preset opts into a batch that applies CPU buffer changes on the GPU while
+preserving the existing copy-back path. In a separate local comparison, the
+batch eliminated the measured stalls logged as title memory changed under
+shader writes in the cell-window segment.
 
 The changes include a reduced-detail texture mode, an ambient-light fallback for
 disabled screen-probe rays, and a cache for repeated Direct3D 12 render-target
@@ -23,6 +39,10 @@ which credits ZJOU's earlier work.
 The mesh dispatch and wide GPU hashing changes come from kelvaroq's patches
 0041 and 0042. The card-buffer size option was adapted from
 [cool_fox](https://github.com/codec-d/cool_fox).
+The render-scale and upscaler hooks come from
+[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA/blob/6a31e431e7ea63264a88ac4da443845670e82ed7/crates/victory-loader/src/hooks.rs),
+via victory-perf and ScarlettPort. Series S interface composition follows
+[Tissma95's VIctory fork patch](https://github.com/fxceless/victory-fork/pull/1189).
 
 ## Getting started on NVIDIA
 
@@ -42,8 +62,34 @@ $env:VICTORY_CARD_BUFFERS_MIN_KB = '256'
 $env:VICTORY_OUTPUT_720P = '1'
 ```
 
-`VICTORY_OUTPUT_720P` scales the final output to 720p. The title chooses its
-internal render resolution.
+`VICTORY_OUTPUT_720P` scales the final output to 720p.
+
+### Optional Series S 540p preset
+
+After setting the NVIDIA options above, run these commands from the repo
+in the same PowerShell session. Replace the example path with the executable
+in your local game folder.
+
+```powershell
+cargo build --release --locked -p victory
+$env:VICTORY_RENDER_SCALE = '0.5'
+$env:VICTORY_OWN_UPSCALER = '1'
+$env:VICTORY_COMPOSE = '1'
+$env:VICTORY_MERGE_BATCH = 'all:on'
+.\target\release\victory.exe run "D:\Games\GTA VI\game_scarlett_master.exe" --execute --console series-s
+```
+
+The render-scale hook checks the title build and expected bytes at startup.
+The tested internal size is 960×540. The HUD is composed on top before
+presentation. These options apply to processes launched from this session.
+
+For a frame-time sample, set `$env:VICTORY_FRAME_LOG = '1'` and
+`$env:RUST_LOG = 'warn,victory_gpu::framelog=info'` before launching. Measure
+after the opening cinematics, once Lucia is controllable. A stationary
+cell-window sample and a separate sample with movement make the timings easier
+to compare. With the keyboard stand-in controller, Esc opens pause and
+Backspace is controller B. In the tested run, holding Backspace for about one
+second resumed gameplay.
 
 The repository ships the compatibility-layer source and uses game files supplied
 locally by the user. See the [asset policy](docs/asset-policy.md).

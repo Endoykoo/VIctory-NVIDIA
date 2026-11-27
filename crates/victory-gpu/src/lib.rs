@@ -21,6 +21,9 @@ mod ambient;
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+/// One dispatch for the title's changes under shader writes (`VICTORY_MERGE_BATCH`, off by default).
+#[cfg(windows)]
+mod mergebatch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -32,6 +35,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod drvwatch;
+#[cfg(windows)]
+mod compose;
 #[cfg(windows)]
 mod fpsbox;
 #[cfg(windows)]

@@ -3527,6 +3527,7 @@ fn late_line(frames: f64) {
     fill_ahead::line(frames);
     crate::launch::line(frames);
     crate::indirect::line(frames);
+    crate::mergebatch::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4244,6 +4245,30 @@ impl Host {
             None => 0,
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        // `VICTORY_MERGE_BATCH` (off by default, `crate::mergebatch`): the
+        // records of this submission per copy, each copy taken into `dirty`.
+        let (batch_mode, mut batch_list, mut batch_runs) = match crate::mergebatch::named() {
+            Some((_, mode)) => {
+                // SAFETY: a plain query.
+                crate::mergebatch::compare_done(unsafe { self.fence.GetCompletedValue() });
+                // (Sent records are kept for landings with the relay, in
+                // mode on only: the check leaves the game's path as it is.)
+                let (records, runs) = crate::mergebatch::take(sent_as, mode == crate::mergebatch::Mode::On && crate::shadow::relay_on());
+                let mut list: Vec<(Arc<crate::shadow::Shadow>, Arc<Vec<[u32; 3]>>)> = Vec::new();
+                if mode != crate::mergebatch::Mode::Count {
+                    for (start, r) in records {
+                        if let Some(copy) = crate::shadow::carded_at(start) {
+                            if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, &copy)) {
+                                dirty.push((copy.clone(), Vec::new()));
+                            }
+                            list.push((copy, r));
+                        }
+                    }
+                }
+                (Some(mode), list, runs)
+            }
+            None => (None, Vec::new(), Vec::new()),
+        };
         // With fetches on a copy queue (`crate::queue2`, bit 1 of
         // `VICTORY_QUEUE2`): the send's number is signalled on the direct
         // queue behind the send, so that a fetch knows which sends the card
@@ -4345,6 +4370,24 @@ impl Host {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
+                        let mine = batch_list.iter().position(|(c, _)| Arc::ptr_eq(c, shadow));
+                        let named = mine.is_some();
+                        let batch_records: Arc<Vec<[u32; 3]>> = mine.map(|i| std::mem::take(&mut batch_list[i].1)).unwrap_or_default();
+                        if named && batch_mode == Some(crate::mergebatch::Mode::Check) {
+                            // The twin and the read-back of before, ahead of the
+                            // copy commands (which run as before).
+                            crate::mergebatch::check(
+                                self,
+                                list,
+                                &shadow.buffer,
+                                size,
+                                &batch_records,
+                                std::mem::take(&mut batch_runs),
+                                !ranges.is_empty(),
+                                self.fence.GetCompletedValue(),
+                                sent + 1,
+                            );
+                        }
                         for &(a, b) in ranges {
                             match &landed {
                                 Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
@@ -4354,6 +4397,27 @@ impl Host {
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        // `VICTORY_MERGE_BATCH=...:on` / `all:on`: the copy's
+                        // records as one dispatch after its copy commands; the
+                        // 64 KiB pieces they touch are hashed again with the
+                        // ranges, and noted as sent for the relay.
+                        let mut batched: Option<Vec<(usize, usize)>> = None;
+                        if named && batch_mode == Some(crate::mergebatch::Mode::On) && !batch_records.is_empty() {
+                            let from = if ranges.is_empty() { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_COPY_DEST };
+                            let to = if before.is_some() { D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE } else { D3D12_RESOURCE_STATE_COMMON };
+                            list.ResourceBarrier(&[transition(&shadow.buffer, from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                            crate::mergebatch::dispatch(self, list, &shadow.buffer, &batch_records, self.fence.GetCompletedValue(), sent + 1);
+                            list.ResourceBarrier(&[transition(&shadow.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, to)]);
+                            let mut spans: Vec<(usize, usize)> = Vec::new();
+                            for r in batch_records.iter() {
+                                let (a, b) = (r[0] as usize * 4, r[0] as usize * 4 + 4);
+                                match spans.last_mut() {
+                                    Some(last) if a / 65536 <= last.1.div_ceil(65536) => last.1 = last.1.max(b),
+                                    _ => spans.push((a, b)),
+                                }
+                            }
+                            batched = Some(spans);
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -4363,7 +4427,7 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if !ranges.is_empty() && batched.is_none() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -4375,11 +4439,16 @@ impl Host {
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                        let mut runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
+                        if let Some(spans) = &batched
+                            && !whole.iter().any(|s| Arc::ptr_eq(s, shadow))
+                        {
+                            runs.extend(spans.iter().map(|&(lo, hi)| shadow.card_run(lo, hi)));
+                        }
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
@@ -8123,7 +8192,13 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present_over(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let preview = crate::capture::take_preview();
@@ -8142,7 +8217,7 @@ impl Host {
             }
             _ => (texture, state),
         };
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, over, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
@@ -8174,7 +8249,7 @@ impl Host {
         }
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(&self, texture: &ID3D12Resource, state: u32, over: Option<(&ID3D12Resource, u32)>, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -8273,26 +8348,44 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            // Test copy (port of fxceless #1189): the interface plane laid
+            // over the game into a texture of ours (`crate::compose`), shown
+            // instead. The game is then in the copy-source state already, and
+            // the laid texture is made and left in it.
+            let copy_source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let (laid, source_state) = match over {
+                Some((ui, ui_state)) => {
+                    if state != copy_source {
+                        list.ResourceBarrier(&[transition(texture, state, copy_source)]);
+                    }
+                    let laid = crate::compose::record(&self.device, list, texture, ui, ui_state);
+                    if let Some(laid) = &laid {
+                        copy.keep(laid);
+                    }
+                    (laid, copy_source)
+                }
+                None => (None, state),
+            };
+            let source = laid.as_ref().unwrap_or(texture);
+            let barrier_from = |to| (source_state != to).then(|| transition(source, source_state, to));
             if let (Some(scaler), Some(descriptors)) = (scaler, descriptors) {
                 let readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
                 let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                let mut before = vec![transition(&back, D3D12_RESOURCE_STATE_PRESENT, target)];
+                before.extend(barrier_from(readable));
+                list.ResourceBarrier(&before);
+                scaler.draw(self, copy, &descriptors, source, &back, (width, height, format));
                 list.ResourceBarrier(&[
-                    transition(texture, state, readable),
-                    transition(&back, D3D12_RESOURCE_STATE_PRESENT, target),
-                ]);
-                scaler.draw(self, copy, &descriptors, texture, &back, (width, height, format));
-                list.ResourceBarrier(&[
-                    transition(texture, readable, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(source, readable, D3D12_RESOURCE_STATE_COPY_SOURCE),
                     transition(&back, target, D3D12_RESOURCE_STATE_COPY_DEST),
                 ]);
                 static REPORTED: std::sync::Once = std::sync::Once::new();
                 REPORTED.call_once(|| tracing::info!(source_width = native.0, source_height = native.1, width, height, "scaled title frame for presentation"));
             } else {
-                list.ResourceBarrier(&[
-                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                    transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
-                ]);
-                list.CopyResource(&back, texture);
+                let mut before = vec![transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+                before.extend(barrier_from(copy_source));
+                list.ResourceBarrier(&before);
+                list.CopyResource(&back, source);
             }
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).

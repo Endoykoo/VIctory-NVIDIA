@@ -61,7 +61,7 @@ enum Held {
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
     /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64, Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -135,6 +135,47 @@ fn present_behind() -> bool {
 /// With [`present_behind`]: puts the present of the next frame behind what
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
+/// Test copy (port of fxceless #1189 via trustno1-coder/VIctory-NVIDIA):
+/// a present's second plane to lay over the first (`crate::compose`), with
+/// `VICTORY_COMPOSE=1`, and the host state the lists leave it in. A Series S
+/// title presents two planes: the game and the interface, 72-byte
+/// descriptions each.
+#[cfg(windows)]
+fn second_plane(
+    planes: u32,
+    plane_parameters: *const Plane,
+    first: This,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    const STRIDE: usize = 72;
+    const COPY_SOURCE: u32 = 0x800;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COMPOSE").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("present planes: a second plane is laid over the first (VICTORY_COMPOSE=1)");
+        }
+        on
+    });
+    if !on || planes < 2 || plane_parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
+    let plane = unsafe { plane_parameters.cast::<u8>().add(STRIDE).cast::<Plane>().as_ref() }?;
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    if resource == first {
+        return None;
+    }
+    let texture = crate::resource::host_resource(resource)?.clone();
+    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    Some((texture, state))
+}
+
+#[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
     if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
         return false;
@@ -163,9 +204,10 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     let texture = texture.clone();
+    let over = second_plane(planes, plane_parameters, resource);
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, frame, over)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -891,10 +933,10 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, frame, over) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present_over(&texture, state, over.as_ref().map(|(t, s)| (t, *s)), frame);
                             }
                         };
                         if all {
@@ -1412,7 +1454,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let over = second_plane(planes, plane_parameters, resource);
+        let shown = host.present_over(texture, state, over.as_ref().map(|(t, s)| (t, *s)), frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

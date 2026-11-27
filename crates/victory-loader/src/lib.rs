@@ -33,6 +33,8 @@ mod threads;
 #[cfg(windows)]
 mod thunks;
 #[cfg(windows)]
+mod hooks;
+#[cfg(windows)]
 mod tls;
 #[cfg(windows)]
 mod windows;

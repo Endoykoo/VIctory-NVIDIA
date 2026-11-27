@@ -455,6 +455,19 @@ fn window_card_room(size: u64, how: &str) -> bool {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
+/// The live copy in the card's memory that starts at `start`, if any
+/// (`crate::mergebatch`).
+pub(crate) fn carded_at(start: u64) -> Option<Arc<Shadow>> {
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.iter().filter_map(std::sync::Weak::upgrade).find(|s| s.start == start)
+}
+
+/// Whether landings take what was sent up into account ([`relay`]): then
+/// `crate::mergebatch` keeps its sent records for them.
+pub(crate) fn relay_on() -> bool {
+    relay()
+}
+
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
@@ -472,6 +485,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
+                    crate::mergebatch::forget_sent(shadow.start, fetched);
                     sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
                 }
                 ranges
@@ -3215,7 +3229,61 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    // `VICTORY_MERGE_BATCH=all:on` (off by default,
+                    // `crate::mergebatch`): every byte the title changed goes
+                    // to the card side as a record of one dispatch, not as a
+                    // copy command of its own, and nothing caps them; the page
+                    // goes into the CPU side whole: where the title did not
+                    // change a byte the two are already equal.
+                    if crate::mergebatch::all_on() {
+                        let m = crate::mergebatch::record_page(self.start, at, title, held);
+                        if m > 0 {
+                            held.copy_from_slice(title);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                        drop(before);
+                        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(at) = copied.get_mut(page - base) {
+                                *at = now;
+                            }
+                        }
+                        continue;
+                    }
                     let runs = joined_over(changed_runs(title, held), merge_gap());
+                    // `VICTORY_MERGE_BATCH=<copy>:<mode>` for one copy: counts,
+                    // the check of the one-dispatch form beside the copy
+                    // commands, or that form instead of them.
+                    let batch = crate::mergebatch::mode_for(self.start, self.len, runs.len(), *runs_left);
+                    if batch.is_some() {
+                        crate::mergebatch::counted(runs.len(), batch != Some(crate::mergebatch::Mode::On) && runs.len() > *runs_left);
+                    }
+                    if batch == Some(crate::mergebatch::Mode::On) {
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            crate::mergebatch::record(self.start, at + r, &title[r..r + m], false);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                        drop(before);
+                        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(at) = copied.get_mut(page - base) {
+                                *at = now;
+                            }
+                        }
+                        continue;
+                    }
+                    // (The check takes the runs whether or not the copy
+                    // commands go: it compares its dispatch on a twin with
+                    // the card side before plus these runs, both from the
+                    // same moment, and the game's path is not changed.)
+                    if batch == Some(crate::mergebatch::Mode::Check) {
+                        for &(r, m) in &runs {
+                            crate::mergebatch::record(self.start, at + r, &title[r..r + m], true);
+                        }
+                    }
                     if runs.len() > *runs_left {
                         MERGED[5].fetch_add(1, Ordering::Relaxed);
                         return true;
@@ -3692,7 +3760,7 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
+        let mut skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             dirty
@@ -3702,6 +3770,8 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
+        // The same for `VICTORY_MERGE_BATCH`'s records, byte by byte.
+        crate::mergebatch::skip(self.start, at, at + n, fetched_after, &mut skip);
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);

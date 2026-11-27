@@ -3959,8 +3959,34 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
+/// Test copy: `VICTORY_VIEWPORT_SIZES=1` counts the title's first viewport
+/// by size and logs the most used sizes every 10 s (what the title renders at).
+fn viewport_sizes(viewports: &[D3D12_VIEWPORT]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_VIEWPORT_SIZES").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let Some(v) = viewports.first() else {
+        return;
+    };
+    type Counts = (Option<std::time::Instant>, Option<std::collections::HashMap<(u32, u32), u64>>);
+    static COUNTS: std::sync::Mutex<Counts> = std::sync::Mutex::new((None, None));
+    let mut c = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    *c.1.get_or_insert_with(Default::default).entry((v.Width as u32, v.Height as u32)).or_default() += 1;
+    let now = std::time::Instant::now();
+    let since = *c.0.get_or_insert(now);
+    if now.duration_since(since).as_secs() >= 10 {
+        let mut top: Vec<_> = c.1.take().unwrap_or_default().into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        let line: Vec<String> = top.iter().take(8).map(|((w, h), n)| format!("{w}x{h}:{n}")).collect();
+        tracing::warn!("viewport sizes (last 10 s, most used first): {}", line.join(" "));
+        c.0 = Some(now);
+    }
+}
+
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+    viewport_sizes(viewports);
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
 }
